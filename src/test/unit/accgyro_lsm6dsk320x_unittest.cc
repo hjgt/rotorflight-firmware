@@ -92,11 +92,12 @@ protected:
     }
 };
 
-TEST_F(Lsm6dsk320x, DetectsOnlyMatchingChip)
+TEST_F(Lsm6dsk320x, DetectsBothSupportedChips)
 {
     for (unsigned id = 0; id <= 255; id++) {
         registers[0x0f] = id;
-        EXPECT_EQ(id == 0x75 ? LSM6DSK320X_SPI : MPU_NONE, lsm6dsk320xSpiDetect(&gyro.dev));
+        const bool supported = (id == LSM6DSK320X_WHO_AM_I_CONST) || (id == LSM6DSV16X_WHO_AM_I_CONST);
+        EXPECT_EQ(supported ? LSM6DSK320X_SPI : MPU_NONE, lsm6dsk320xSpiDetect(&gyro.dev));
     }
     EXPECT_TRUE(writes.empty());
     gyro.mpuDetectionResult.sensor = LSM6DSO_SPI;

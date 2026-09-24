@@ -59,6 +59,8 @@ bool cliMode = false;
 #include "config/feature.h"
 
 #include "drivers/accgyro/accgyro.h"
+#include "drivers/accgyro/accgyro_mpu.h"
+#include "drivers/accgyro/accgyro_spi_lsm6dsk320x.h"
 #include "drivers/adc.h"
 #include "drivers/buf_writer.h"
 #include "drivers/bus_i2c.h"
@@ -4033,6 +4035,27 @@ static void cliGpsPassthrough(const char *cmdName, char *cmdline)
 #if defined(USE_GYRO_REGISTER_DUMP) && !defined(SIMULATOR_BUILD)
 static void cliPrintGyroRegisters(uint8_t whichSensor)
 {
+#if defined(USE_ACCGYRO_LSM6DSK320X)
+    // LSM sensors do not use the MPU register map: WHO_AM_I is at 0x0f, and 0x75/0x1a/0x1b
+    // are reserved, so the MPU reads below only ever report 0x00 or 0xff on this sensor.
+    if (gyroMpuDetectionResult()->sensor == LSM6DSK320X_SPI) {
+        // The LSM6DSV16X is register compatible with the LSM6DSK320X and shares this driver.
+        const uint8_t whoAmI = gyroReadRegister(whichSensor, 0x0F);
+        const bool is320X = whoAmI == LSM6DSK320X_WHO_AM_I_CONST;
+
+        cliPrintLinef("# WHO_AM_I  0x%X (0x70 LSM6DSV16X, 0x75 LSM6DSK320X)", whoAmI);
+        cliPrintLinef("# CTRL1     0x%X (0x19)", gyroReadRegister(whichSensor, 0x10)); // high-accuracy accelerometer, 1 kHz
+        cliPrintLinef("# CTRL2     0x%X (0x1C)", gyroReadRegister(whichSensor, 0x11)); // high-accuracy gyro, 8 kHz
+        cliPrintLinef("# CTRL3     0x%X (0x44)", gyroReadRegister(whichSensor, 0x12)); // BDU and auto-increment
+        cliPrintLinef("# CTRL6     0x%X (%s)", gyroReadRegister(whichSensor, 0x15),
+                      is320X ? "0x0C, FS_G is bits [2:0] and bit 3 must be 1" : "0x04, FS_G is bits [3:0]");
+        cliPrintLinef("# CTRL7     0x%X (0x01)", gyroReadRegister(whichSensor, 0x16)); // gyro LPF1 enable
+        cliPrintLinef("# CTRL8     0x%X (0x03)", gyroReadRegister(whichSensor, 0x17)); // +/-16 g, LPF2 ODR/4
+        cliPrintLinef("# INT1_CTRL 0x%X (0x02)", gyroReadRegister(whichSensor, 0x0D)); // gyro data ready on INT1
+        return;
+    }
+#endif
+
     cliPrintLinef("# WHO_AM_I    0x%X", gyroReadRegister(whichSensor, MPU_RA_WHO_AM_I));
     cliPrintLinef("# CONFIG      0x%X", gyroReadRegister(whichSensor, MPU_RA_CONFIG));
     cliPrintLinef("# GYRO_CONFIG 0x%X", gyroReadRegister(whichSensor, MPU_RA_GYRO_CONFIG));

@@ -88,13 +88,13 @@
 #define LSM6DSV_HAODR_CFG_HAODR_SEL_MASK                    0x03
 #define LSM6DSV_HAODR_CFG_HAODR_SEL_SHIFT                   0
 #define LSM6DSV_HAODR_MODE1                                 1
-#define LSM6DSK320X_WHO_AM_I_CONST          (0x75)
 
 uint8_t lsm6dsk320xSpiDetect(const extDevice_t *dev)
 {
     const uint8_t who_am_i = spiReadRegMsk(dev, LSM6DSV_WHO_AM_I);
 
-    if (who_am_i != LSM6DSK320X_WHO_AM_I_CONST) {
+    // The LSM6DSV16X is register compatible with the LSM6DSK320X and is driven by the same code.
+    if (who_am_i != LSM6DSK320X_WHO_AM_I_CONST && who_am_i != LSM6DSV16X_WHO_AM_I_CONST) {
         return MPU_NONE;
     }
 
