@@ -1,0 +1,51 @@
+name: LSM6DSK320X validation
+
+on:
+  push:
+    branches: ['feat/lsm6dsk320x']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [STM32F405, STM32F411, STM32F7X2, STM32F745, STM32G47X, STM32H743]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository ARM GCC 9.3.1 toolchain
+        run: make arm_sdk_install
+      - name: Compile firmware
+        run: make TARGET=${{ matrix.target }} -j4 FC_VER_SUFFIX=LSM6DSK320X-${GITHUB_SHA::7}
+      - name: Checksum firmware
+        run: cd obj && sha256sum *.hex > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lsm6dsk320x-${{ matrix.target }}
+          path: |
+            obj/*.hex
+            obj/SHA256SUMS
+          if-no-files-found: error
+
+  driver-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host test dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libblocksruntime-dev
+      - name: DMA tests
+        run: make -C src/test test_accgyro_lsm6dsk320x_unittest
+      - name: Tests without DMA
+        run: >-
+          make -C src/test test_accgyro_lsm6dsk320x_unittest
+          OBJECT_DIR=../../obj/test-lsm6-nodma
+          accgyro_lsm6dsk320x_unittest_DEFINES='USE_ACCGYRO_LSM6DSK320X= USE_SPI_GYRO='
+      - name: Experimental filter tests
+        run: >-
+          make -C src/test test_accgyro_lsm6dsk320x_unittest
+          OBJECT_DIR=../../obj/test-lsm6-experimental
+          accgyro_lsm6dsk320x_unittest_DEFINES='USE_ACCGYRO_LSM6DSK320X= USE_SPI_GYRO= USE_DMA= USE_GYRO_DLPF_EXPERIMENTAL='

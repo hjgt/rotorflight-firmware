@@ -3,6 +3,16 @@
 This file is collecting the changes in the firmware that are affecting
 the APIs or flight performance.
 
+## LSM6DSK320X support (unreleased)
+
+- Add the ST LSM6DSK320X SPI accelerometer/gyroscope driver, ported from Betaflight.
+- Add `LSM6DSK320X` to CLI sensor names and `acc_hardware` choices. `AUTO` detects it.
+- Append gyro hardware ID 22 and accelerometer hardware ID 23; existing IDs are unchanged.
+- Use 8 kHz gyro and 1 kHz accelerometer sampling, +/-2000 dps and +/-16 g ranges.
+- Include the driver in unified F405, F7, G47X and H743 builds; exclude F411 as with
+  other newer IMU drivers. Board wiring and alignment still come from target configuration.
+- See [driver notes](docs/LSM6DSK320X.md) for provenance and validation limits.
+
 
 ## Flight Performance
 
