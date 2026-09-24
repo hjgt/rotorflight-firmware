@@ -20,7 +20,7 @@ jobs:
       - name: Install repository ARM GCC 9.3.1 toolchain
         run: make arm_sdk_install
       - name: Compile firmware
-        run: make TARGET=${{ matrix.target }} -j4 FC_VER_SUFFIX=LSM6DSK320X-${GITHUB_SHA::7}
+        run: make TARGET=${{ matrix.target }} -j4
       - name: Checksum firmware
         run: cd obj && sha256sum *.hex > SHA256SUMS
       - uses: actions/upload-artifact@v4
