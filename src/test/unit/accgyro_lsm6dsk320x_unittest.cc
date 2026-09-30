@@ -190,7 +190,8 @@ TEST_F(Lsm6dsk320x, FallsBackWhenInterruptsAreMissing)
 {
     dma_available = true;
     gyro.detectedEXTI = 1000;
-    ASSERT_TRUE(gyro.readFn(&gyro));
+    // The first call only configures acquisition, so it reports that no sample was read
+    ASSERT_FALSE(gyro.readFn(&gyro));
     EXPECT_EQ(GYRO_EXTI_NO_INT, gyro.gyroModeSPI);
     EXPECT_EQ(0u, sequence_count);
     setSample();
@@ -202,7 +203,7 @@ TEST_F(Lsm6dsk320x, FallsBackWhenInterruptsAreMissing)
 TEST_F(Lsm6dsk320x, FallsBackWhenDmaIsUnavailable)
 {
     gyro.detectedEXTI = 1001;
-    ASSERT_TRUE(gyro.readFn(&gyro));
+    ASSERT_FALSE(gyro.readFn(&gyro));
     EXPECT_EQ(GYRO_EXTI_INT, gyro.gyroModeSPI);
 }
 
@@ -211,7 +212,7 @@ TEST_F(Lsm6dsk320x, ReadsCombinedDmaFrameAtCorrectOffsets)
 {
     dma_available = true;
     gyro.detectedEXTI = 1001;
-    ASSERT_TRUE(gyro.readFn(&gyro));
+    ASSERT_FALSE(gyro.readFn(&gyro));
     ASSERT_EQ(GYRO_EXTI_INT_DMA, gyro.gyroModeSPI);
     EXPECT_EQ(0xa2, tx_buffer[0]);
     EXPECT_EQ(13, gyro.segments[0].len);
@@ -233,7 +234,7 @@ TEST_F(Lsm6dsk320x, FallsBackWhenDmaIsNotCompiled)
 {
     dma_available = true;
     gyro.detectedEXTI = 1001;
-    ASSERT_TRUE(gyro.readFn(&gyro));
+    ASSERT_FALSE(gyro.readFn(&gyro));
     EXPECT_EQ(GYRO_EXTI_INT, gyro.gyroModeSPI);
 }
 #endif
