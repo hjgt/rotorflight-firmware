@@ -61,39 +61,44 @@ ODRs on every enabled target; no MPU-style sample divider is applied.
 The new gyro retains Rotorflight's conservative software overflow checking until
 hardware testing establishes whether it can be marked as overflow protected.
 
+## Upstream fixes applied
+
+The port started from the pinned revision above. Betaflight has since reworked the same source file
+(`accgyro_spi_lsm6dsv16x.c` on `master`, where the LSM6DSV16X and LSM6DSK320X support share one
+implementation, in `lsm6dsvConfigure()`). The two defects below were fixed by porting that work.
+
+### `CTRL6` bit 3 on the LSM6DSK320X
+
+The port used to write `CTRL6` as `LPF1_G_BW | FS_G_2000DPS`, that is `0x04`, `0x14`, `0x24` or
+`0x34` depending on the hardware LPF. On the 320X `FS_G` is only bits `[2:0]` and **bit 3 must be
+1** (datasheet DS15060 Table 64, reset value `0x08`), so the gyro full-scale selection was invalid.
+
+`lsm6dsk320xGyroInit()` now reads `WHO_AM_I` after the software reset and sets bit 3 only for the
+320X, matching upstream's `(whoAmI == LSM6DSK320X_WHO_AM_I_CONST ? 0x08 : 0) | ...`. The register
+values are `0x0c`/`0x1c`/`0x2c`/`0x3c` on the LSM6DSK320X and `0x04`/`0x14`/`0x24`/`0x34` on the
+LSM6DSV16X, whose `FS_G` occupies bits `[3:0]`.
+
+### `OP_MODE` and `ODR` write order
+
+The port wrote the operating mode together with the ODR (`CTRL1 = 0x19`, `CTRL2 = 0x1c`). Upstream
+splits this: both sensors are put into the required `OP_MODE` while still powered down, then the ODR
+is written after a short delay with the `OP_MODE` bits retained. Its comment records the consequence
+of the combined write: "otherwise the rates become 7.68 kHz / 960 Hz".
+
+`lsm6dsk320xGyroInit()` now programs the mode-only values first and writes `CTRL2` then `CTRL1` with
+the ODRs last, so the sensor runs at the 8 kHz / 1 kHz declared in `gyro_sync.c`.
+
 ## Known issues
-
-The port is a copy of the pinned upstream revision above. Betaflight has since reworked the same
-source file (`accgyro_spi_lsm6dsv16x.c` on `master`, where the LSM6DSV16X and LSM6DSK320X support
-share one implementation). The defects below are still present here.
-
-### `CTRL6` bit 3 is cleared, which is not allowed on this part
-
-`lsm6dsk320xGyroInit()` writes `CTRL6` as `LPF1_G_BW | FS_G_2000DPS`, that is `0x04`, `0x14`,
-`0x24` or `0x34` depending on the hardware LPF. On the 320X `FS_G` is only bits `[2:0]` and **bit 3
-must be 1** (datasheet DS15060 Table 64, reset value `0x08`), so the value for ±2000 dps has to be
-`0x0c`. Upstream now writes `(whoAmI == LSM6DSK320X_WHO_AM_I_CONST ? 0x08 : 0) | ...`.
-
-This affects only the LSM6DSK320X: on the LSM6DSV16X `FS_G` occupies bits `[3:0]`, where `0x04` is
-the correct value, so the fix has to be conditioned on the detected `WHO_AM_I` and must not be
-applied unconditionally. Until then the LSM6DSK320X gyro full-scale selection is invalid.
-
-### `OP_MODE` and `ODR` are programmed in a single register write
-
-The port writes `OP_MODE` together with `ODR` (`CTRL1 = 0x19`, `CTRL2 = 0x1c`). Upstream splits
-them: both sensors are put into the required `OP_MODE` while still powered down, then the ODR is
-written after a short delay with the `OP_MODE` bits retained. Its comment records the consequence of
-the combined write: "otherwise the rates become 7.68 kHz / 960 Hz". The rates declared in
-`gyro_sync.c` (8000 Hz / 1000 Hz) therefore do not match the sensor's actual rates, which skews
-rate-dependent filtering and the gyro integration.
 
 ### Initialisation is not verified
 
-Upstream performs the software reset with retries, verifies every initialisation write by reading
-the register back (`lsm6dsvWriteRegVerified()`, `LSM6DSV_INIT_ATTEMPTS` = 3) and reports
-`FAILURE_GYRO_INIT_FAILED` when the sensor cannot be configured. The port does none of this, so a
-sensor that ignores its configuration writes leaves the firmware running with a silently
-unconfigured gyro and no warning in `status`.
+Upstream clears both ODRs before `SW_RESET` so that a sensor left running by an MCU-only reset is
+powered down first (AN5763 sections 3.1 and 5.7), polls `CTRL3` until the reset completes instead of
+relying on a fixed delay, verifies every initialisation write by reading the register back
+(`lsm6dsvWriteRegVerified()`, `LSM6DSV_INIT_ATTEMPTS` = 3) and reports `FAILURE_GYRO_INIT_FAILED`
+when the sensor cannot be configured. The port does none of this, so a sensor that ignores its
+configuration writes leaves the firmware running with a silently unconfigured gyro and no warning in
+`status`, and a dropped `SW_RESET` write is not detected.
 
 Two related differences to review when re-syncing: upstream returns `false` from the read function
 during `GYRO_EXTI_INIT` so that no stale sample is consumed, and it uses a driver-specific DMA

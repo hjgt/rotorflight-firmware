@@ -15,6 +15,7 @@
  * along with this software. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -58,6 +59,8 @@ protected:
         dma_available = false;
         gyro.dev.txBuf = tx_buffer;
         gyro.dev.rxBuf = rx_buffer;
+        // Initialisation reads WHO_AM_I to tell the two supported chips apart.
+        registers[0x0f] = LSM6DSV16X_WHO_AM_I_CONST;
         gyro.mpuDetectionResult.sensor = LSM6DSK320X_SPI;
         acc.mpuDetectionResult.sensor = LSM6DSK320X_SPI;
         acc.gyro = &gyro;
@@ -119,12 +122,17 @@ TEST_F(Lsm6dsk320x, InitializesHighAccuracyRatesScalesAndInterrupt)
     EXPECT_EQ(0x01, registers[0x62]); // high-accuracy ODR mode 1
     EXPECT_EQ(0x19, registers[0x10]); // high-accuracy accelerometer, 1 kHz
     EXPECT_EQ(0x1c, registers[0x11]); // high-accuracy gyro, 8 kHz
-    EXPECT_EQ(0x04, registers[0x15]); // 2000 dps, normal LPF
+    EXPECT_EQ(0x04, registers[0x15]); // 2000 dps, normal LPF; bit 3 stays clear on the 16X
     EXPECT_EQ(0x03, registers[0x17]); // 16 g, LPF2 ODR/4
     EXPECT_EQ(0x01, registers[0x16]); // gyro LPF1 enabled
     EXPECT_EQ(0x08, registers[0x18]); // accelerometer LPF2 enabled
     EXPECT_EQ(0x02, registers[0x13]); // pulsed DRDY
-    EXPECT_EQ(std::make_pair(uint8_t(0x0d), uint8_t(0x02)), writes.back());
+    // Operating mode is programmed while powered down, and the ODR is only added afterwards
+    // with those mode bits retained: writing both at once yields 7.68 kHz / 960 Hz.
+    EXPECT_EQ(1, std::count(writes.begin(), writes.end(), std::make_pair(uint8_t(0x10), uint8_t(0x10))));
+    EXPECT_EQ(1, std::count(writes.begin(), writes.end(), std::make_pair(uint8_t(0x11), uint8_t(0x10))));
+    EXPECT_EQ(std::make_pair(uint8_t(0x11), uint8_t(0x1c)), writes[writes.size() - 2]); // gyro first
+    EXPECT_EQ(std::make_pair(uint8_t(0x10), uint8_t(0x19)), writes.back());
     EXPECT_EQ(1u, exti_init_count);
     EXPECT_FLOAT_EQ(0.070f, gyro.scale);
     EXPECT_EQ(2048, acc.acc_1G);
@@ -134,6 +142,15 @@ TEST_F(Lsm6dsk320x, InitializesHighAccuracyRatesScalesAndInterrupt)
     EXPECT_EQ(0, gyro.mpuDividerDrops);
     EXPECT_EQ(0x22, gyro.gyroDataReg);
     EXPECT_EQ(0x28, gyro.accDataReg);
+}
+
+TEST_F(Lsm6dsk320x, SetsCtrl6Bit3ForTheLsm6dsk320x)
+{
+    registers[0x0f] = LSM6DSK320X_WHO_AM_I_CONST;
+    gyro.initFn(&gyro);
+    EXPECT_EQ(0x0c, registers[0x15]); // 2000 dps with the mandatory bit 3 set
+    EXPECT_EQ(0x19, registers[0x10]);
+    EXPECT_EQ(0x1c, registers[0x11]);
 }
 
 TEST_F(Lsm6dsk320x, AppliesPerDeviceHardwareFilter)
@@ -226,6 +243,7 @@ void spiWriteReg(const extDevice_t *, uint8_t reg, uint8_t value)
 uint16_t spiCalculateDivider(uint32_t frequency) { spi_frequency = frequency; return 16; }
 void spiSetClkDivisor(const extDevice_t *, uint16_t) {}
 void delay(timeMs_t ms) { reset_delay_ms += ms; }
+void delayMicroseconds(uint32_t) {}
 void mpuGyroInit(gyroDev_t *) { exti_init_count++; }
 bool spiUseDMA(const extDevice_t *) { return dma_available; }
 busStatus_e mpuIntcallback(uint32_t) { return BUS_READY; }
