@@ -22,21 +22,18 @@ The unified `STM32F405`, `STM32F7X2`, `STM32F745`, `STM32G47X` and `STM32H743`
 targets include it. F411 excludes it, consistent with the existing restrictions
 on newer IMUs. Legacy board-specific targets can opt in with the same define.
 
-Detection checks `WHO_AM_I` register `0x0f` for `0x75` (LSM6DSK320X) or `0x70` (LSM6DSV16X).
-The register compatible LSM6DSV16X is driven by the same code and is reported as
-`LSM6DSK320X_SPI`, so `status` names it `LSM6DSK320X` too. The gyro is detected automatically.
-The accelerometer supports `acc_hardware = AUTO` (the default) or
-`acc_hardware = LSM6DSK320X`. Hardware enum values are appended, preserving all existing IDs
-including FAKE: gyro ID 22, accelerometer ID 23.
+Detection checks `WHO_AM_I` register `0x0f` for `0x75`. The gyro is detected automatically. The
+accelerometer supports `acc_hardware = AUTO` (the default) or `acc_hardware = LSM6DSK320X`.
+Hardware enum values are appended, preserving all existing IDs including FAKE: gyro ID 22,
+accelerometer ID 23. The reset sequence verifies the identity again by re-reading `WHO_AM_I`.
 
-Any other ID leaves the gyro undetected, which `status` reports as `NOGYRO` together with
-`Devices detected: SPI:0`. That includes the LSM6DSV320X (`0x0f` returns `0x73`). Note that
-`0x70` is shared with the LSM6DSV32X, which upstream distinguishes by reading `CTRL8` bit 2;
-this port does not implement that check, so an LSM6DSV32X would be configured as an
-LSM6DSV16X.
+Only the LSM6DSK320X is supported. The pin compatible LSM6DSV16X (`0x0f` returns `0x70`) and
+LSM6DSV320X (`0x0f` returns `0x73`) are different parts and are not detected. Any other ID
+leaves the gyro undetected, which `status` reports as `NOGYRO` together with
+`Devices detected: SPI:0`.
 
-`gyroregisters` dumps the LSM control registers (`0x0f`, `0x10`-`0x17`, `0x0d`) when one of
-these sensors is the active gyro. Its MPU register set (`0x75`, `0x1a`, `0x1b`) is reserved on
+`gyroregisters` dumps the LSM control registers (`0x0f`, `0x10`-`0x17`, `0x0d`) while an
+LSM6DSK320X is the active gyro. Its MPU register set (`0x75`, `0x1a`, `0x1b`) is reserved on
 this part and only reports `0x00`/`0xff`; note also that after a failed detection the CS pin is
 handed back by `spiPreinitByTag()`, so every register then reads `0xff` regardless of the
 hardware.
@@ -61,48 +58,43 @@ ODRs on every enabled target; no MPU-style sample divider is applied.
 The new gyro retains Rotorflight's conservative software overflow checking until
 hardware testing establishes whether it can be marked as overflow protected.
 
-## Upstream fixes applied
+## Upstream alignment
 
 The port started from the pinned revision above. Betaflight has since reworked the same source file
-(`accgyro_spi_lsm6dsv16x.c` on `master`, where the LSM6DSV16X and LSM6DSK320X support share one
-implementation, in `lsm6dsvConfigure()`). The two defects below were fixed by porting that work.
+(`accgyro_spi_lsm6dsv16x.c` on `master`, where `lsm6dsvReset()`, `lsm6dsvConfigure()` and
+`lsm6dsvGyroInit()` serve the LSM6DSV16X, LSM6DSV32X and LSM6DSK320X). The corrections and
+robustness fixes below were ported from that work, so initialisation now follows the upstream flow.
 
-### `CTRL6` bit 3 on the LSM6DSK320X
+- **`CTRL6` bit 3 must be 1.** The port wrote `CTRL6` as `LPF1_G_BW | FS_G_2000DPS`, that is `0x04`,
+  `0x14`, `0x24` or `0x34`, clearing bit 3. On this part `FS_G` is only bits `[2:0]` and bit 3 must
+  be 1 (datasheet DS15060 Table 64, reset value `0x08`), so the full-scale selection was invalid.
+  `CTRL6` is now written as `0x0c`/`0x1c`/`0x2c`/`0x3c`.
+- **`OP_MODE` and `ODR` are written separately.** The operating mode is programmed while both sensors
+  are powered down, and the ODRs follow afterwards with those mode bits retained, gyro before
+  accelerometer and 500 us apart. Setting mode and ODR in one write leaves the rates at
+  7.68 kHz / 960 Hz instead of the 8 kHz / 1 kHz declared in `gyro_sync.c`.
+- **Both sensors are powered down before `SW_RESET`** by clearing their ODRs, because an MCU-only
+  reset may leave the IMU running (AN5763 sections 3.1 and 5.7). `SW_RESET` also sets `BDU` back to
+  1, so `BDU` is cleared first: a dropped `SW_RESET` write can then no longer pass as a completed
+  reset and leave the previous firmware's `CTRL8` in place.
+- **The reset is polled, not assumed.** After the fixed 10 ms settling delay, `CTRL3` is read until
+  `SW_RESET` clears with `BDU` set, bounded by `LSM6DSK320X_RESET_TIMEOUT_MS` (20 ms).
+- **Every initialisation write is read back and verified**, and the whole sequence is retried
+  `LSM6DSK320X_INIT_ATTEMPTS` (3) times.
+- **A sensor that cannot be configured is reported** with `failureMode(FAILURE_GYRO_INIT_FAILED)`
+  instead of being left silently unconfigured.
+- **The read function returns `false` during `GYRO_EXTI_INIT`**, so the call that only configures
+  acquisition cannot be mistaken for a sample.
 
-The port used to write `CTRL6` as `LPF1_G_BW | FS_G_2000DPS`, that is `0x04`, `0x14`, `0x24` or
-`0x34` depending on the hardware LPF. On the 320X `FS_G` is only bits `[2:0]` and **bit 3 must be
-1** (datasheet DS15060 Table 64, reset value `0x08`), so the gyro full-scale selection was invalid.
+## Remaining divergence from upstream
 
-`lsm6dsk320xGyroInit()` now reads `WHO_AM_I` after the software reset and sets bit 3 only for the
-320X, matching upstream's `(whoAmI == LSM6DSK320X_WHO_AM_I_CONST ? 0x08 : 0) | ...`. The register
-values are `0x0c`/`0x1c`/`0x2c`/`0x3c` on the LSM6DSK320X and `0x04`/`0x14`/`0x24`/`0x34` on the
-LSM6DSV16X, whose `FS_G` occupies bits `[3:0]`.
-
-### `OP_MODE` and `ODR` write order
-
-The port wrote the operating mode together with the ODR (`CTRL1 = 0x19`, `CTRL2 = 0x1c`). Upstream
-splits this: both sensors are put into the required `OP_MODE` while still powered down, then the ODR
-is written after a short delay with the `OP_MODE` bits retained. Its comment records the consequence
-of the combined write: "otherwise the rates become 7.68 kHz / 960 Hz".
-
-`lsm6dsk320xGyroInit()` now programs the mode-only values first and writes `CTRL2` then `CTRL1` with
-the ODRs last, so the sensor runs at the 8 kHz / 1 kHz declared in `gyro_sync.c`.
-
-## Known issues
-
-### Initialisation is not verified
-
-Upstream clears both ODRs before `SW_RESET` so that a sensor left running by an MCU-only reset is
-powered down first (AN5763 sections 3.1 and 5.7), polls `CTRL3` until the reset completes instead of
-relying on a fixed delay, verifies every initialisation write by reading the register back
-(`lsm6dsvWriteRegVerified()`, `LSM6DSV_INIT_ATTEMPTS` = 3) and reports `FAILURE_GYRO_INIT_FAILED`
-when the sensor cannot be configured. The port does none of this, so a sensor that ignores its
-configuration writes leaves the firmware running with a silently unconfigured gyro and no warning in
-`status`, and a dropped `SW_RESET` write is not detected.
-
-Two related differences to review when re-syncing: upstream returns `false` from the read function
-during `GYRO_EXTI_INIT` so that no stale sample is consumed, and it uses a driver-specific DMA
-callback rather than the shared `mpuIntcallback`.
+- **DMA callback.** Upstream uses a driver-specific `lsm6dsv16xDmaCallback` with
+  `gyro->lsm6dsvDmaSequence` / `lsm6dsvDmaReady` bookkeeping, which requires those fields in
+  `gyroDev_t`. This port keeps Rotorflight's shared `mpuIntcallback`, as the surrounding Rotorflight
+  drivers do.
+- **Single part.** Upstream distinguishes LSM6DSV16X, LSM6DSV32X and LSM6DSK320X with separate sensor
+  enums and tells the 32X from the 16X by reading `CTRL8` bit 2. This driver detects and configures
+  the LSM6DSK320X only.
 
 ## Validation
 
@@ -112,10 +104,10 @@ Run the focused host tests with:
 make -C src/test test_accgyro_lsm6dsk320x_unittest
 ```
 
-The tests cover chip identification, initialization registers, scaling, LPF options,
-sample-rate declarations, signed little-endian reads, DMA frame offsets and fallback
-when interrupts or DMA are absent. They use mocked SPI and cannot validate electrical
-signals, actual interrupt timing, sensor noise or flight behavior.
+The tests cover chip identification, initialization registers, reset verification, scaling, LPF
+options, sample-rate declarations, signed little-endian reads, DMA frame offsets, init failure
+reporting and fallback when interrupts or DMA are absent. They use mocked SPI and cannot validate
+electrical signals, actual interrupt timing, sensor noise or flight behavior.
 
 Use the repository's ARM GCC 9.3.1 toolchain for full firmware builds:
 

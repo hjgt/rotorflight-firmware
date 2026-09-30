@@ -24,6 +24,7 @@ extern "C" {
 #include "platform.h"
 #include "drivers/accgyro/accgyro_spi_lsm6dsk320x.h"
 #include "drivers/accgyro/gyro_sync.h"
+#include "drivers/system.h"
 #include "drivers/time.h"
 #include "pg/accel.h"
 }
@@ -38,6 +39,7 @@ static uint8_t registers[128];
 static std::vector<std::pair<uint8_t, uint8_t>> writes;
 static unsigned reset_delay_ms;
 static unsigned exti_init_count;
+static unsigned failure_mode_count;
 static unsigned sequence_count;
 static unsigned wait_count;
 static uint32_t spi_frequency;
@@ -54,13 +56,13 @@ protected:
     {
         memset(registers, 0, sizeof(registers));
         writes.clear();
-        reset_delay_ms = exti_init_count = sequence_count = wait_count = 0;
+        reset_delay_ms = exti_init_count = failure_mode_count = sequence_count = wait_count = 0;
         spi_frequency = 0;
         dma_available = false;
         gyro.dev.txBuf = tx_buffer;
         gyro.dev.rxBuf = rx_buffer;
-        // Initialisation reads WHO_AM_I to tell the two supported chips apart.
-        registers[0x0f] = LSM6DSV16X_WHO_AM_I_CONST;
+        // The reset verifies the chip identity, so the mock has to answer as a LSM6DSK320X.
+        registers[0x0f] = LSM6DSK320X_WHO_AM_I_CONST;
         gyro.mpuDetectionResult.sensor = LSM6DSK320X_SPI;
         acc.mpuDetectionResult.sensor = LSM6DSK320X_SPI;
         acc.gyro = &gyro;
@@ -95,12 +97,11 @@ protected:
     }
 };
 
-TEST_F(Lsm6dsk320x, DetectsBothSupportedChips)
+TEST_F(Lsm6dsk320x, DetectsOnlyMatchingChip)
 {
     for (unsigned id = 0; id <= 255; id++) {
         registers[0x0f] = id;
-        const bool supported = (id == LSM6DSK320X_WHO_AM_I_CONST) || (id == LSM6DSV16X_WHO_AM_I_CONST);
-        EXPECT_EQ(supported ? LSM6DSK320X_SPI : MPU_NONE, lsm6dsk320xSpiDetect(&gyro.dev));
+        EXPECT_EQ(id == LSM6DSK320X_WHO_AM_I_CONST ? LSM6DSK320X_SPI : MPU_NONE, lsm6dsk320xSpiDetect(&gyro.dev));
     }
     EXPECT_TRUE(writes.empty());
     gyro.mpuDetectionResult.sensor = LSM6DSO_SPI;
@@ -115,14 +116,18 @@ TEST_F(Lsm6dsk320x, InitializesHighAccuracyRatesScalesAndInterrupt)
     gyro.initFn(&gyro);
     acc.initFn(&acc);
     ASSERT_FALSE(writes.empty());
-    EXPECT_EQ(std::make_pair(uint8_t(0x12), uint8_t(0x01)), writes.front());
+    // An MCU-only reset can leave the IMU running, so both sensors are powered down before
+    // SW_RESET, and the reset is then polled until it reports complete.
+    EXPECT_EQ(1, std::count(writes.begin(), writes.end(), std::make_pair(uint8_t(0x10), uint8_t(0x00))));
+    EXPECT_EQ(1, std::count(writes.begin(), writes.end(), std::make_pair(uint8_t(0x11), uint8_t(0x00))));
+    EXPECT_EQ(1, std::count(writes.begin(), writes.end(), std::make_pair(uint8_t(0x12), uint8_t(0x01))));
     EXPECT_EQ(10u, reset_delay_ms);
     EXPECT_EQ(10000000u, spi_frequency);
     EXPECT_EQ(0x44, registers[0x12]); // BDU and auto-increment
     EXPECT_EQ(0x01, registers[0x62]); // high-accuracy ODR mode 1
     EXPECT_EQ(0x19, registers[0x10]); // high-accuracy accelerometer, 1 kHz
     EXPECT_EQ(0x1c, registers[0x11]); // high-accuracy gyro, 8 kHz
-    EXPECT_EQ(0x04, registers[0x15]); // 2000 dps, normal LPF; bit 3 stays clear on the 16X
+    EXPECT_EQ(0x0c, registers[0x15]); // 2000 dps, normal LPF, mandatory bit 3 set
     EXPECT_EQ(0x03, registers[0x17]); // 16 g, LPF2 ODR/4
     EXPECT_EQ(0x01, registers[0x16]); // gyro LPF1 enabled
     EXPECT_EQ(0x08, registers[0x18]); // accelerometer LPF2 enabled
@@ -144,20 +149,20 @@ TEST_F(Lsm6dsk320x, InitializesHighAccuracyRatesScalesAndInterrupt)
     EXPECT_EQ(0x28, gyro.accDataReg);
 }
 
-TEST_F(Lsm6dsk320x, SetsCtrl6Bit3ForTheLsm6dsk320x)
+TEST_F(Lsm6dsk320x, ReportsInitFailureWhenTheResetNeverCompletes)
 {
-    registers[0x0f] = LSM6DSK320X_WHO_AM_I_CONST;
+    registers[0x0f] = 0x70; // an unsupported LSM6DSV16X: the reset verification cannot pass
     gyro.initFn(&gyro);
-    EXPECT_EQ(0x0c, registers[0x15]); // 2000 dps with the mandatory bit 3 set
-    EXPECT_EQ(0x19, registers[0x10]);
-    EXPECT_EQ(0x1c, registers[0x11]);
+    EXPECT_EQ(1u, failure_mode_count);
+    EXPECT_EQ(0x00, registers[0x15]); // the configuration was never applied
+    EXPECT_EQ(0u, exti_init_count);
 }
 
 TEST_F(Lsm6dsk320x, AppliesPerDeviceHardwareFilter)
 {
-    const uint8_t expected[] = {0x04, 0x24, 0x14,
+    const uint8_t expected[] = {0x0c, 0x2c, 0x1c,
 #ifdef USE_GYRO_DLPF_EXPERIMENTAL
-        0x34,
+        0x3c,
 #endif
     };
     for (unsigned filter = 0; filter < GYRO_HARDWARE_LPF_COUNT; filter++) {
@@ -239,12 +244,18 @@ void spiWriteReg(const extDevice_t *, uint8_t reg, uint8_t value)
 {
     writes.emplace_back(reg, value);
     registers[reg] = value;
+    if (reg == 0x12 && (value & 0x01)) {
+        // SW_RESET is self-clearing and the reset leaves BDU set; modelling that keeps the
+        // driver's reset poll from timing out.
+        registers[reg] = 0x40;
+    }
 }
 uint16_t spiCalculateDivider(uint32_t frequency) { spi_frequency = frequency; return 16; }
 void spiSetClkDivisor(const extDevice_t *, uint16_t) {}
 void delay(timeMs_t ms) { reset_delay_ms += ms; }
 void delayMicroseconds(uint32_t) {}
 void mpuGyroInit(gyroDev_t *) { exti_init_count++; }
+void failureMode(failureMode_e) { failure_mode_count++; }
 bool spiUseDMA(const extDevice_t *) { return dma_available; }
 busStatus_e mpuIntcallback(uint32_t) { return BUS_READY; }
 void spiWait(const extDevice_t *) { wait_count++; }

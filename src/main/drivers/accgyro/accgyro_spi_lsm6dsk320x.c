@@ -30,12 +30,17 @@
 
 #ifdef USE_ACCGYRO_LSM6DSK320X
 
+#include "common/utils.h"
+
 #include "drivers/accgyro/accgyro.h"
 #include "drivers/accgyro/accgyro_spi_lsm6dsk320x.h"
 #include "drivers/bus_spi.h"
+#include "drivers/system.h"
 #include "drivers/time.h"
 
 #define LSM6DSK320X_MAX_SPI_CLK_HZ 10000000
+#define LSM6DSK320X_RESET_TIMEOUT_MS 20
+#define LSM6DSK320X_INIT_ATTEMPTS 3
 #define GYRO_EXTI_DETECT_THRESHOLD 1000
 #define LSM6DSV_ENCODE_BITS(val, mask, shift)   (((val) << (shift)) & (mask))
 #define LSM6DSV_INT1_CTRL                   0x0D
@@ -71,7 +76,7 @@
 #define LSM6DSV_CTRL6_FS_G_MASK                         0x0f
 #define LSM6DSV_CTRL6_FS_G_SHIFT                        0
 #define LSM6DSV_CTRL6_FS_G_2000DPS                      0x04
-#define LSM6DSV_CTRL6_FS_G_320X_BIT3                    0x08 // FS_G is only bits [2:0] on the 320X; bit 3 must be 1
+#define LSM6DSK320X_CTRL6_FS_G_BIT3                     0x08 // FS_G is only bits [2:0] on this part; bit 3 must be 1
 #define LSM6DSV_CTRL7                       0x16
 #define LSM6DSV_CTRL7_LPF1_G_EN                         0x01
 #define LSM6DSV_CTRL8                       0x17
@@ -94,8 +99,7 @@ uint8_t lsm6dsk320xSpiDetect(const extDevice_t *dev)
 {
     const uint8_t who_am_i = spiReadRegMsk(dev, LSM6DSV_WHO_AM_I);
 
-    // The LSM6DSV16X is register compatible with the LSM6DSK320X and is driven by the same code.
-    if (who_am_i != LSM6DSK320X_WHO_AM_I_CONST && who_am_i != LSM6DSV16X_WHO_AM_I_CONST) {
+    if (who_am_i != LSM6DSK320X_WHO_AM_I_CONST) {
         return MPU_NONE;
     }
 
@@ -170,9 +174,46 @@ bool lsm6dsk320xSpiAccDetect(accDev_t *acc)
     return true;
 }
 
-static void lsm6dsk320xGyroInit(gyroDev_t *gyro)
+static bool lsm6dsk320xWriteRegVerified(const extDevice_t *dev, uint8_t reg, uint8_t value)
 {
-    const extDevice_t *dev = &gyro->dev;
+    spiWriteReg(dev, reg, value);
+    return spiReadRegMsk(dev, reg) == value;
+}
+
+static bool lsm6dsk320xReset(const extDevice_t *dev)
+{
+    // An MCU-only reset may leave the IMU running. Power down both sensors before SW_RESET,
+    // preserving the operating modes until both ODRs are zero (AN5763 sections 3.1 and 5.7).
+    const uint8_t ctrl1 = spiReadRegMsk(dev, LSM6DSV_CTRL1) & ~LSM6DSV_CTRL1_ODR_XL_MASK;
+    const uint8_t ctrl2 = spiReadRegMsk(dev, LSM6DSV_CTRL2) & ~LSM6DSV_CTRL2_ODR_G_MASK;
+    // SW_RESET sets BDU back to 1. Clearing it first keeps a dropped SW_RESET write from
+    // passing as a completed reset and leaving the previous firmware's CTRL8 in place.
+    if (!lsm6dsk320xWriteRegVerified(dev, LSM6DSV_CTRL1, ctrl1) ||
+        !lsm6dsk320xWriteRegVerified(dev, LSM6DSV_CTRL2, ctrl2) ||
+        !lsm6dsk320xWriteRegVerified(dev, LSM6DSV_CTRL3, LSM6DSV_CTRL3_IF_INC)) {
+        return false;
+    }
+
+    delayMicroseconds(500);
+    spiWriteReg(dev, LSM6DSV_CTRL3, LSM6DSV_CTRL3_SW_RESET);
+
+    // Retain the reset settling time, then bound the retries if SW_RESET never clears
+    delay(10);
+    for (unsigned elapsedMs = 10; elapsedMs <= LSM6DSK320X_RESET_TIMEOUT_MS; elapsedMs++) {
+        const uint8_t ctrl3 = spiReadRegMsk(dev, LSM6DSV_CTRL3);
+        if ((ctrl3 & (LSM6DSV_CTRL3_SW_RESET | LSM6DSV_CTRL3_BDU)) == LSM6DSV_CTRL3_BDU) {
+            return spiReadRegMsk(dev, LSM6DSV_WHO_AM_I) == LSM6DSK320X_WHO_AM_I_CONST;
+        }
+        if (elapsedMs < LSM6DSK320X_RESET_TIMEOUT_MS) {
+            delay(1);
+        }
+    }
+
+    return false;
+}
+
+static bool lsm6dsk320xConfigure(const extDevice_t *dev, uint8_t hardware_lpf)
+{
     // Set default LPF1 filter bandwidth to be as close as possible to MPU6000's 250Hz cutoff
     static const uint8_t lpf_bandwidth_options[GYRO_HARDWARE_LPF_COUNT] = {
             [GYRO_HARDWARE_LPF_NORMAL] = LSM6DSV_CTRL6_FS_G_BW_288HZ,
@@ -183,6 +224,10 @@ static void lsm6dsk320xGyroInit(gyroDev_t *gyro)
 #endif
     };
 
+    if (!lsm6dsk320xReset(dev)) {
+        return false;
+    }
+
     const uint8_t accel_mode = LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL1_OP_MODE_XL_HIGH_ACCURACY,
                                                    LSM6DSV_CTRL1_OP_MODE_XL_MASK,
                                                    LSM6DSV_CTRL1_OP_MODE_XL_SHIFT);
@@ -190,79 +235,83 @@ static void lsm6dsk320xGyroInit(gyroDev_t *gyro)
                                                   LSM6DSV_CTRL2_OP_MODE_G_MASK,
                                                   LSM6DSV_CTRL2_OP_MODE_G_SHIFT);
 
+    const struct {
+        uint8_t reg;
+        uint8_t value;
+    } config[] = {
+            // Autoincrement burst reads and latch each output word until both bytes are read
+            { LSM6DSV_CTRL3, LSM6DSV_CTRL3_IF_INC | LSM6DSV_CTRL3_BDU },
+            // Configure HAODR mode on both sensors while both remain powered down
+            { LSM6DSV_HAODR_CFG, LSM6DSV_ENCODE_BITS(LSM6DSV_HAODR_MODE1,
+                                                     LSM6DSV_HAODR_CFG_HAODR_SEL_MASK,
+                                                     LSM6DSV_HAODR_CFG_HAODR_SEL_SHIFT) },
+            // Set the operating modes while both sensors stay powered down
+            { LSM6DSV_CTRL1, accel_mode },
+            { LSM6DSV_CTRL2, gyro_mode },
+            // +/-16G mode, accelerometer LPF2 bandwidth ODR/4
+            { LSM6DSV_CTRL8, LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL8_HP_LPF2_XL_BW_4,
+                                                 LSM6DSV_CTRL8_HP_LPF2_XL_BW_2_MASK,
+                                                 LSM6DSV_CTRL8_HP_LPF2_XL_BW_2_SHIFT) |
+                             LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL8_FS_XL_16G,
+                                                 LSM6DSV_CTRL8_FS_XL_MASK,
+                                                 LSM6DSV_CTRL8_FS_XL_SHIFT) },
+            // Enable the accelerometer digital LPF2 filter
+            { LSM6DSV_CTRL9, LSM6DSV_CTRL9_LPF2_XL_EN },
+            // +/-2000 dps and the selected LPF1 filter setting. FS_G is only bits [2:0] on the
+            // LSM6DSK320X, where bit 3 must be 1 (DS15060 Table 64, reset value 0x08).
+            { LSM6DSV_CTRL6, LSM6DSK320X_CTRL6_FS_G_BIT3 |
+                             LSM6DSV_ENCODE_BITS(lpf_bandwidth_options[hardware_lpf],
+                                                 LSM6DSV_CTRL6_LPF1_G_BW_MASK,
+                                                 LSM6DSV_CTRL6_LPF1_G_BW_SHIFT) |
+                             LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL6_FS_G_2000DPS,
+                                                 LSM6DSV_CTRL6_FS_G_MASK,
+                                                 LSM6DSV_CTRL6_FS_G_SHIFT) },
+            // Enable the gyro digital LPF1 filter
+            { LSM6DSV_CTRL7, LSM6DSV_CTRL7_LPF1_G_EN },
+            // Generate a pulse on the interrupt line, not requiring a read to clear
+            { LSM6DSV_CTRL4, LSM6DSV_CTRL4_DRDY_PULSED },
+            // Interrupt on INT1 when new gyro data is ready
+            { LSM6DSV_INT1_CTRL, LSM6DSV_INT1_CTRL_INT1_DRDY_G },
+    };
+
+    for (unsigned index = 0; index < ARRAYLEN(config); index++) {
+        if (!lsm6dsk320xWriteRegVerified(dev, config[index].reg, config[index].value)) {
+            return false;
+        }
+    }
+
+    // Allow the power-down state to settle, then start the gyro before the accelerometer.
+    // Retaining the mode bits while setting the ODR is what keeps the rates at 8 kHz / 1 kHz:
+    // programming mode and ODR in a single write leaves them at 7.68 kHz / 960 Hz.
+    delayMicroseconds(500);
+    return lsm6dsk320xWriteRegVerified(dev, LSM6DSV_CTRL2,
+                gyro_mode | LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL2_ODR_G_8000HZ,
+                                                LSM6DSV_CTRL2_ODR_G_MASK,
+                                                LSM6DSV_CTRL2_ODR_G_SHIFT)) &&
+           lsm6dsk320xWriteRegVerified(dev, LSM6DSV_CTRL1,
+                accel_mode | LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL1_ODR_XL_1000HZ,
+                                                 LSM6DSV_CTRL1_ODR_XL_MASK,
+                                                 LSM6DSV_CTRL1_ODR_XL_SHIFT));
+}
+
+static void lsm6dsk320xGyroInit(gyroDev_t *gyro)
+{
+    const extDevice_t *dev = &gyro->dev;
+
     spiSetClkDivisor(dev, spiCalculateDivider(LSM6DSK320X_MAX_SPI_CLK_HZ));
 
-    // Perform a software reset
-    spiWriteReg(dev, LSM6DSV_CTRL3, LSM6DSV_CTRL3_SW_RESET);
+    bool configured = false;
+    for (unsigned attempt = 0; attempt < LSM6DSK320X_INIT_ATTEMPTS && !configured; attempt++) {
+        configured = lsm6dsk320xConfigure(dev, gyro->hardware_lpf);
+    }
+    if (!configured) {
+        failureMode(FAILURE_GYRO_INIT_FAILED);
+        return;
+    }
 
-    // Wait for the device to be ready
-    delay(10);
-
-    // CTRL6 bit 3 must be 1 on the LSM6DSK320X, where FS_G occupies bits [2:0] only. On the
-    // LSM6DSV16X FS_G occupies bits [3:0] and bit 3 must stay clear.
-    const uint8_t who_am_i = spiReadRegMsk(dev, LSM6DSV_WHO_AM_I);
-
-    // Autoincrement burst reads and latch each output word until both bytes are read
-    spiWriteReg(dev, LSM6DSV_CTRL3, LSM6DSV_CTRL3_IF_INC | LSM6DSV_CTRL3_BDU);
-
-    // Select high-accuracy ODR mode 1
-    spiWriteReg(dev, LSM6DSV_HAODR_CFG,
-                LSM6DSV_ENCODE_BITS(LSM6DSV_HAODR_MODE1,
-                                    LSM6DSV_HAODR_CFG_HAODR_SEL_MASK,
-                                    LSM6DSV_HAODR_CFG_HAODR_SEL_SHIFT));
-
-    // Enable 16G sensitivity
-    // Set accelerometer LPF2 bandwidth to ODR/4
-    spiWriteReg(dev, LSM6DSV_CTRL8,
-                LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL8_HP_LPF2_XL_BW_4,
-                                    LSM6DSV_CTRL8_HP_LPF2_XL_BW_2_MASK,
-                                    LSM6DSV_CTRL8_HP_LPF2_XL_BW_2_SHIFT) |
-                LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL8_FS_XL_16G,
-                                    LSM6DSV_CTRL8_FS_XL_MASK,
-                                    LSM6DSV_CTRL8_FS_XL_SHIFT));
-
-    // Enable 2000 deg/s sensitivity and selected LPF1 filter setting
-    // Set the LPF1 filter bandwidth
-    spiWriteReg(dev, LSM6DSV_CTRL6,
-                (who_am_i == LSM6DSK320X_WHO_AM_I_CONST ? LSM6DSV_CTRL6_FS_G_320X_BIT3 : 0) |
-                LSM6DSV_ENCODE_BITS(lpf_bandwidth_options[gyro->hardware_lpf],
-                                    LSM6DSV_CTRL6_LPF1_G_BW_MASK,
-                                    LSM6DSV_CTRL6_LPF1_G_BW_SHIFT) |
-                LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL6_FS_G_2000DPS,
-                                    LSM6DSV_CTRL6_FS_G_MASK,
-                                    LSM6DSV_CTRL6_FS_G_SHIFT));
-
-    // Program the operating modes while both sensors stay powered down. Their ODRs are written
-    // afterwards with the mode bits retained: setting mode and ODR in a single write leaves the
-    // rates at 7.68 kHz / 960 Hz instead of the 8 kHz / 1 kHz declared in gyro_sync.c.
-    spiWriteReg(dev, LSM6DSV_CTRL1, accel_mode);
-    spiWriteReg(dev, LSM6DSV_CTRL2, gyro_mode);
-
-    // Enable the gyro digital LPF1 filter
-    spiWriteReg(dev, LSM6DSV_CTRL7, LSM6DSV_CTRL7_LPF1_G_EN);
-
-    // Enable the acc digital LPF2 filter
-    spiWriteReg(dev, LSM6DSV_CTRL9, LSM6DSV_CTRL9_LPF2_XL_EN);
-
-    // Generate pulse on interrupt line, not requiring a read to clear
-    spiWriteReg(dev, LSM6DSV_CTRL4, LSM6DSV_CTRL4_DRDY_PULSED);
-
-    // Betaflight uses 70 mdps/LSB for the +/-2000 dps range.
+    // From section 4.1, Mechanical characteristics, of the datasheet: G_So is 70 mdps/LSB
+    // for FS = +/-2000 dps.
     gyro->scale = 0.070f;
-
-    // Enable the INT1 output to interrupt when new gyro data is ready
-    spiWriteReg(dev, LSM6DSV_INT1_CTRL, LSM6DSV_INT1_CTRL_INT1_DRDY_G);
-
-    // Allow the power-down state to settle, then start the gyro before the accelerometer
-    delayMicroseconds(500);
-    spiWriteReg(dev, LSM6DSV_CTRL2, gyro_mode |
-                LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL2_ODR_G_8000HZ,
-                                    LSM6DSV_CTRL2_ODR_G_MASK,
-                                    LSM6DSV_CTRL2_ODR_G_SHIFT));
-    spiWriteReg(dev, LSM6DSV_CTRL1, accel_mode |
-                LSM6DSV_ENCODE_BITS(LSM6DSV_CTRL1_ODR_XL_1000HZ,
-                                    LSM6DSV_CTRL1_ODR_XL_MASK,
-                                    LSM6DSV_CTRL1_ODR_XL_SHIFT));
 
     mpuGyroInit(gyro);
     gyro->accDataReg = LSM6DSV_OUTX_L_A;
@@ -303,7 +352,8 @@ static bool lsm6dsk320xGyroReadSPI(gyroDev_t *gyro)
         } else {
             gyro->gyroModeSPI = GYRO_EXTI_NO_INT;
         }
-        break;
+        // This call configures acquisition; no sensor data has been read yet.
+        return false;
     }
 
     case GYRO_EXTI_INT:

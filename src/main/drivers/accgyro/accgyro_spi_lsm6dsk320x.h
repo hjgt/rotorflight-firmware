@@ -27,9 +27,8 @@
 #include "drivers/accgyro/accgyro.h"
 #include "drivers/bus_spi.h"
 
-// WHO_AM_I values of the two register compatible sensors this driver supports. Both are
-// reported as LSM6DSK320X_SPI; WHO_AM_I is the only way to tell them apart.
-#define LSM6DSV16X_WHO_AM_I_CONST           (0x70)
+// WHO_AM_I value of the LSM6DSK320X. The pin compatible LSM6DSV16X (0x70) and LSM6DSV320X
+// (0x73) are different parts and are not driven by this driver.
 #define LSM6DSK320X_WHO_AM_I_CONST          (0x75)
 
 uint8_t lsm6dsk320xSpiDetect(const extDevice_t *dev);
